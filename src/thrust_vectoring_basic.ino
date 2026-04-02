@@ -34,26 +34,32 @@ gyro_bias_y = 0.0
 gyro_bias_z = 0.0
 
 # Complementary filter weight
-alpha = 0.98
+alpha = 0.40
 
 # ---------------- Servo settings ----------------
 roll_center = 80
-pitch_center = 85
+pitch_center = 130
 
 kp_roll = 0.8
-kp_pitch = 2
+kp_pitch = 1.5
 
 roll_sign = 1
-pitch_sign = -1
+pitch_sign = 1
 
-roll_min = 30
-roll_max = 110
+roll_min = 35
+roll_max = 130
 
-pitch_min = 0
-pitch_max = 130
+pitch_min = 40
+pitch_max = 180
 
-angle_deadband = 0.3
+angle_deadband = 3.0
+servo_smoothing = 0.2
 
+boost_threshold = 15.0
+full_actuation_tilt = 30.0
+boost_exp_gain_roll = 0.2
+boost_exp_gain_pitch = 0.5
+    
 # 50 Hz servo pulse range mapped to 16-bit PWM duty
 min_duty = 1638
 max_duty = 8192
@@ -86,6 +92,9 @@ def apply_deadband(x, deadband):
         return 0.0
     return x
 
+def low_pass(prev, new, smoothing):
+    return prev + smoothing * (new - prev)
+
 def angle_to_duty(angle):
     angle = clamp(angle, 0, 180)
     return int(min_duty + (angle / 180.0) * (max_duty - min_duty))
@@ -103,11 +112,10 @@ def mpu_init():
 
 # ---------------- Gyro calibration ----------------
 def calibrate_gyro(samples=500):
-    global gyro_bias_x, gyro_bias_y, gyro_bias_z
+    global gyro_bias_x, gyro_bias_y
 
     sum_x = 0
     sum_y = 0
-    sum_z = 0
 
     print("Calibrating gyro... keep system still")
 
@@ -115,23 +123,21 @@ def calibrate_gyro(samples=500):
         data = read_bytes(0x43, 6)
         gx = to_int16(data[0], data[1])
         gy = to_int16(data[2], data[3])
-        gz = to_int16(data[4], data[5])
 
         sum_x += gx
         sum_y += gy
-        sum_z += gz
 
         time.sleep_ms(2)
 
     gyro_bias_x = sum_x / samples
     gyro_bias_y = sum_y / samples
-    gyro_bias_z = sum_z / samples
 
-    print("Gyro bias:", gyro_bias_x, gyro_bias_y, gyro_bias_z)
+    print("Gyro roll bias:", gyro_bias_x)
+    print("Gyro pitch bias:", gyro_bias_y)
 
 # ---------------- Sensor fusion ----------------
 def update_imu(dt):
-    global RateRoll, RatePitch, RateYaw
+    global RateRoll, RatePitch
     global AccX, AccY, AccZ
     global acc_roll, acc_pitch
     global AngleRoll, AnglePitch
@@ -144,18 +150,17 @@ def update_imu(dt):
     gyro_data = read_bytes(0x43, 6)
     gyro_x_raw = to_int16(gyro_data[0], gyro_data[1]) - gyro_bias_x
     gyro_y_raw = to_int16(gyro_data[2], gyro_data[3]) - gyro_bias_y
-    gyro_z_raw = to_int16(gyro_data[4], gyro_data[5]) - gyro_bias_z
 
     RateRoll = gyro_x_raw / 65.5
     RatePitch = gyro_y_raw / 65.5
-    RateYaw = gyro_z_raw / 65.5
 
-    AccX = (acc_x_lsb / 4096.0) + 0.014
-    AccY = (acc_y_lsb / 4096.0) + 0.010
-    AccZ = (acc_z_lsb / 4096.0) - 0.010
 
-    acc_roll = math.degrees(math.atan2(AccY, math.sqrt(AccX * AccX + AccZ * AccZ))) - 0.5
-    acc_pitch = math.degrees(math.atan2(AccX, math.sqrt(AccY * AccY + AccZ * AccZ))) - 3.0
+    AccX = (acc_x_lsb / 4096.0) 
+    AccY = (acc_y_lsb / 4096.0) 
+    AccZ = (acc_z_lsb / 4096.0) 
+
+    acc_roll = math.degrees(math.atan2(AccY, math.sqrt(AccX * AccX + AccZ * AccZ))) + 3.5
+    acc_pitch = math.degrees(math.atan2(AccX, math.sqrt(AccY * AccY + AccZ * AccZ))) - 4.7
 
     gyro_roll = AngleRoll + RateRoll * dt
     gyro_pitch = AnglePitch + RatePitch * dt
@@ -163,34 +168,68 @@ def update_imu(dt):
     AngleRoll = alpha * gyro_roll + (1.0 - alpha) * acc_roll
     AnglePitch = alpha * gyro_pitch + (1.0 - alpha) * acc_pitch
 
-# ---------------- Servo control ----------------
-servo1 = PWM(Pin("D4"))
-servo2 = PWM(Pin("D5"))
-servo1.freq(50)
-servo2.freq(50)
+# ---------------- Shared control law ----------------
+def control_axis(angle, center, axis_sign, min_angle, max_angle, kp, boost_exp_gain):
+    # Determine sign and magnitude of tilt
+    if angle >= 0:
+        sign_angle = 1
+    else:
+        sign_angle = -1
 
-def set_servo_angle(filtered_roll, filtered_pitch):
-    global servo_angle_roll, servo_angle_pitch
+    mag = abs(angle)
+    mag = apply_deadband(mag, angle_deadband)
 
-    filtered_roll = apply_deadband(filtered_roll, angle_deadband)
-    filtered_pitch = apply_deadband(filtered_pitch, angle_deadband)
+    # Determine which direction servo will move for this tilt
+    servo_direction = axis_sign * sign_angle
 
-    target_roll = roll_center + (roll_sign * kp_roll * filtered_roll)
-    target_pitch = pitch_center + (pitch_sign * kp_pitch * filtered_pitch)
+    # Available servo travel depends on direction
+    if servo_direction > 0:
+        max_control = max_angle - center
+    else:
+        max_control = center - min_angle
 
-    target_roll = clamp(target_roll, roll_min, roll_max)
-    target_pitch = clamp(target_pitch, pitch_min, pitch_max)
+    if max_control < 0:
+        max_control = 0
 
-    # No smoothing
-    servo_angle_roll = target_roll
-    servo_angle_pitch = target_pitch
+    # Control at threshold using normal proportional law
+    control_at_threshold = kp * boost_threshold
+    if control_at_threshold > max_control:
+        control_at_threshold = max_control
 
-    duty1 = angle_to_duty(servo_angle_roll)
-    duty2 = angle_to_duty(servo_angle_pitch)
+    # Region 1: normal proportional response up to 15 deg
+    if mag <= boost_threshold:
+        control_mag = kp * mag
 
-    servo1.duty_u16(duty1)
-    servo2.duty_u16(duty2)
+    # Region 2: smooth exponential ramp from 15 deg to 30 deg
+    elif mag < full_actuation_tilt:
+        extra = mag - boost_threshold
+        span = full_actuation_tilt - boost_threshold
 
+        num = math.exp(boost_exp_gain * extra) - 1.0
+        den = math.exp(boost_exp_gain * span) - 1.0
+
+        if den == 0:
+            ramp = extra / span
+        else:
+            ramp = num / den
+
+        control_mag = control_at_threshold + (max_control - control_at_threshold) * ramp
+
+    # Region 3: 30 deg and above = full available actuation
+    else:
+        control_mag = max_control
+
+    # Restore sign
+    control = sign_angle * control_mag
+
+    # Convert to servo target
+    target = center + (axis_sign * control)
+
+    # Constrain target
+    target = max(min_angle, min(max_angle, target))
+
+    return target
+    
 # ---------------- Startup ----------------
 mpu_init()
 calibrate_gyro()
@@ -204,8 +243,10 @@ AnglePitch = acc_pitch
 
 servo_angle_roll = roll_center
 servo_angle_pitch = pitch_center
-servo1.duty_u16(angle_to_duty(servo_angle_roll))
-servo2.duty_u16(angle_to_duty(servo_angle_pitch))
+    
+servo_roll.duty_u16(angle_to_duty(servo_angle_roll, roll_min, roll_max))
+servo_pitch.duty_u16(angle_to_duty(servo_angle_pitch, pitch_min, pitch_max))
+    
 time.sleep_ms(1000)
 
 # ---------------- Main loop ----------------
@@ -220,11 +261,22 @@ while True:
         dt = 0.02
 
     update_imu(dt)
-    set_servo_angle(AngleRoll, AnglePitch)
+
+    target_roll = control_axis(AngleRoll, roll_center, roll_sign, roll_min, roll_max, kp_roll,boost_exp_gain_roll)
+
+    target_pitch = control_axis(AnglePitch, pitch_center, pitch_sign, pitch_min, pitch_max, kp_pitch, boost_exp_gain_pitch)
+
+    # Smooth servo motion
+    servo_angle_roll = low_pass(servo_angle_roll, target_roll, servo_smoothing)
+    servo_angle_pitch = low_pass(servo_angle_pitch, target_pitch, servo_smoothing)
+
+    # Output PWM
+    servo_roll.duty_u16(angle_to_duty(servo_angle_roll, roll_min, roll_max))
+    servo_pitch.duty_u16(angle_to_duty(servo_angle_pitch, pitch_min, pitch_max))
 
     print(
-        "acc_roll={:.2f} acc_pitch={:.2f} filt_roll={:.2f} filt_pitch={:.2f} srv_roll={:.2f} srv_pitch={:.2f} dt={:.4f}".format(
-            acc_roll, acc_pitch, AngleRoll, AnglePitch, servo_angle_roll, servo_angle_pitch, dt
+        "roll={:.2f} pitch={:.2f} srv_roll={:.2f} srv_pitch={:.2f} dt={:.4f}".format(
+            AngleRoll, AnglePitch, servo_angle_roll, servo_angle_pitch, dt
         )
     )
 
