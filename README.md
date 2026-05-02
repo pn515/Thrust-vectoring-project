@@ -10,3 +10,9 @@ This project is a thrust vectoring prototype using an Arduino, MPU6050 IMU, and 
 
 ## Project function
 The MPU6050 measures movement and orientation. The Arduino processes the data and sends control signals to the servo motors, which adjust thrust direction in the X and Y axes.
+
+## Repository Structure
+
+- `src/` contains the project source code
+- `src/testing/roll_only_test.ino` contains supporting code used for roll-axis testing
+- `src/testing/pitch_only_test.ino` contains supporting code used for pitch-axis testing
